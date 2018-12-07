@@ -14,6 +14,8 @@ namespace op
 //__constant__ float kernel[]
 __constant__ float deviceKernel[14112];
 
+// __global__ void unroll_Kernel(const int M, const int C, const int H, const int W, const int K, float *X, float *X_unrolled, float *y)
+// {
 __global__ void unroll_Kernel(const int C, const int H, const int W, const int K, float *X, float *X_unrolled)
 {
     int c, s, h_out, w_out, w_unroll, h_unroll, p, q;
@@ -21,32 +23,30 @@ __global__ void unroll_Kernel(const int C, const int H, const int W, const int K
     int H_out = H - K + 1;
     int W_out = W - K + 1;
     int W_unroll = H_out * W_out;
+    int H_unroll = C * K * K;
 
-    if(t < C * W_unroll)
+    if(t < C * K * K * W_unroll)
     {
-        c = t / W_unroll;
-        s = t % W_unroll;
-        h_out = s / W_out;
-        w_out = s % W_out;
-        w_unroll = s;
-        #pragma unroll
-        for(p = 0;p < K;p++)
-        {
-            #pragma unroll
-            for(q = 0;q < K;q++)
-            {
-                h_unroll = c * K * K + p * K + q;
-                X_unrolled[h_unroll * W_unroll + w_unroll] = X[c * H * W + (h_out + p) * W + w_out + q];
-            }
-        }
+        c = t / (K * K * W_unroll);
+        s = t % (K * K * W_unroll);
+        w_unroll = t % W_unroll;
+        h_unroll = t / W_unroll;
+        p = s / W_unroll / K;
+        q = s / W_unroll % K;
+        h_out = w_unroll / W_out;
+        w_out = w_unroll % W_out;
+        X_unrolled[h_unroll * W_unroll + w_unroll] = X[c * H * W + (h_out + p) * W + w_out + q];
     }
 
+    __syncthreads();
 }
 
 __global__ void gemm_Kernel(const int M, const int H_unroll, const int W_unroll, float *X_unrolled, float *y)
 {
     __shared__ float input[TILE_SIZE_ * TILE_SIZE_];
     __shared__ float localkernel[TILE_SIZE_ * TILE_SIZE_];
+    // int tx = threadIdx.x % TILE_SIZE_, ty = threadIdx.x / TILE_SIZE_;
+    // int bx = blockIdx.x % (int)ceil(W_unroll / TILE_SIZE), by = blockIdx.x / ceil(W_unroll / TILE_SIZE);
     int tx = threadIdx.x, ty = threadIdx.y;
     int bx = blockIdx.x, by = blockIdx.y;
     int row = by * TILE_SIZE + ty, col = bx * TILE_SIZE + tx;
@@ -99,27 +99,32 @@ void forward<gpu, float>(mshadow::Tensor<gpu, 4, float> &y, const mshadow::Tenso
     const int H_unroll = C * K * K;
     // const int block_width = TILE_SIZE + K - 1;
     float *X_unrolled;
-    cudaMalloc((void **)&X_unrolled, B / 4 * W_unroll * H_unroll * sizeof(float));
+    cudaMalloc((void **)&X_unrolled, 20 * W_unroll * H_unroll * sizeof(float));
     // ...
     cudaStream_t s = y.stream_->stream_;
-    cudaStream_t stream[B/4];
-    for(int i = 0;i < B / 4;i++)
+    cudaStream_t stream[20];
+    // cudaStream_t stream[2500];
+    // cudaMalloc((void **)&stream, sizeof(cudaStream_t) * B / 4);
+    // stream = (cudaStream_t *)malloc(sizeof(cudaStream_t) * B / 4);
+    for(int i = 0;i < 20;i++)
         cudaStreamCreate(&stream[i]);
+
     cudaMemcpyToSymbol(deviceKernel, w.dptr_, sizeof(float) * K * K * M * C, 0, cudaMemcpyHostToDevice);
   
-    #pragma unroll
-    for(int i = 0;i < 4;i++)
+    // #pragma unroll
+    for(int i = 0;i < 500;i++)
     {
-        #pragma unroll 100
-        for(int j = 0;j < B / 4;j++)
+        // #pragma unroll
+        for(int j = 0;j < 20;j++)
         {
-            int n = i * (B / 4) + j;
-            cudaStreamCreate(&stream[j]); 
-            unroll_Kernel<<<ceil((C * H_out * W_out) * 1.0 /CUDA_MAX_NUM_THREADS), CUDA_MAX_NUM_THREADS, 0, stream[j]>>>(C, H, W, K ,&(((float *)x.dptr_)[n * C * H * W]), &X_unrolled[j * H_unroll * W_unroll]);
+            int n = i * 20 + j;
+            // cudaStreamCreate(&stream[j]); 
+            unroll_Kernel<<<ceil((H_unroll * W_unroll) * 1.0 /CUDA_MAX_NUM_THREADS), CUDA_MAX_NUM_THREADS, 0, stream[j]>>>(C, H, W, K ,&(((float *)x.dptr_)[n * C * H * W]), &X_unrolled[j * W_unroll * H_unroll]);
+            // unroll_Kernel<<<ceil((H_unroll * W_unroll) * 1.0 /CUDA_MAX_NUM_THREADS), CUDA_MAX_NUM_THREADS, 0, stream[j]>>>(M, C, H, W, K ,&(((float *)x.dptr_)[n * C * H * W]), &X_unrolled[j * W_unroll * H_unroll], &(((float *)y.dptr_)[n * M * W_unroll]));
             // MSHADOW_CUDA_CALL(cudaDeviceSynchronize());
             dim3 dimBlock(TILE_SIZE, TILE_SIZE, 1);
             dim3 dimGrid(ceil(W_unroll / TILE_SIZE), ceil(M / TILE_SIZE), 1);
-            gemm_Kernel<<<dimGrid, dimBlock, 0, stream[j]>>>(M, H_unroll, W_unroll, &X_unrolled[j * H_unroll * W_unroll], &(((float *)y.dptr_)[n * M * W_unroll]));
+            gemm_Kernel<<<dimGrid, dimBlock, 0, stream[j]>>>(M, H_unroll, W_unroll, &X_unrolled[j * W_unroll * H_unroll], &(((float *)y.dptr_)[n * M * W_unroll]));
             // MSHADOW_CUDA_CALL(cudaDeviceSynchronize()); 
         }
     }
